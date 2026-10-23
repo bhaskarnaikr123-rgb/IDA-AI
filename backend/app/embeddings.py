@@ -8,7 +8,14 @@ class EmbeddingService:
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     ):
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        self._model = None
+
+    @property
+    def model(self):
+        if self._model is None:
+            self._model = SentenceTransformer(self.model_name)
+        return self._model
 
     def embed_texts(self, texts: list[str]) -> np.ndarray:
         if not texts:
@@ -16,6 +23,7 @@ class EmbeddingService:
 
         embeddings = self.model.encode(
             texts,
+            batch_size=8,
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
