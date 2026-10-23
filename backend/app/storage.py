@@ -1,131 +1,109 @@
 
-import sqlite3
-from pathlib import Path
+import base64
+import os
 
 import numpy as np
+from supabase import Client, create_client
 
 from app.chunking import DocumentChunk
 from app.pipeline import DocumentIndex
 
 
 class DocumentStorage:
-    def __init__(self, db_path: str | Path):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path=None):
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SECRET_KEY")
+
+        if not url or not key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_SECRET_KEY must be configured."
+            )
+
+        self.client: Client = create_client(url, key)
         self.initialize()
 
-    def connect(self):
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
+    
     def initialize(self):
-        with self.connect() as connection:
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS documents (
-                    document_id TEXT PRIMARY KEY,
-                    filename TEXT NOT NULL,
-                    chunk_count INTEGER NOT NULL
-                )
-            """)
+        # Verify that both Supabase tables are accessible.
+        self.client.table("documents").select(
+            "document_id"
+        ).limit(1).execute()
 
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS chunks (
-                    document_id TEXT NOT NULL,
-                    chunk_id INTEGER NOT NULL,
-                    filename TEXT NOT NULL,
-                    page_number INTEGER,
-                    text TEXT NOT NULL,
-                    embedding BLOB NOT NULL,
-                    PRIMARY KEY (document_id, chunk_id),
-                    FOREIGN KEY (document_id)
-                        REFERENCES documents(document_id)
-                        ON DELETE CASCADE
-                )
-            """)
+        self.client.table("chunks").select(
+            "document_id"
+        ).limit(1).execute()
 
-            connection.execute("PRAGMA foreign_keys = ON")
 
     def save_index(self, document_id: str, index: DocumentIndex):
         if len(index.chunks) != len(index.embeddings):
             raise ValueError("Each chunk must have one embedding")
 
-        with self.connect() as connection:
-            connection.execute(
-                "DELETE FROM chunks WHERE document_id = ?",
-                (document_id,),
-            )
-            connection.execute(
-                "DELETE FROM documents WHERE document_id = ?",
-                (document_id,),
-            )
+        filename = index.chunks[0].filename if index.chunks else ""
 
-            connection.execute(
-                """
-                INSERT INTO documents
-                (document_id, filename, chunk_count)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    document_id,
-                    index.chunks[0].filename if index.chunks else "",
-                    len(index.chunks),
-                ),
-            )
+        self.client.table("documents").upsert({
+            "document_id": document_id,
+            "filename": filename,
+            "chunk_count": len(index.chunks),
+        }).execute()
 
-            for chunk, embedding in zip(index.chunks, index.embeddings):
-                vector = np.asarray(embedding, dtype=np.float32)
+        # Remove old chunks before saving the replacement index.
+        self.client.table("chunks").delete().eq(
+            "document_id", document_id
+        ).execute()
 
-                connection.execute(
-                    """
-                    INSERT INTO chunks
-                    (document_id, chunk_id, filename, page_number, text, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        document_id,
-                        chunk.chunk_id,
-                        chunk.filename,
-                        chunk.page_number,
-                        chunk.text,
-                        sqlite3.Binary(vector.tobytes()),
-                    ),
-                )
+        rows = []
+        for chunk, embedding in zip(index.chunks, index.embeddings):
+            vector = np.asarray(embedding, dtype=np.float32)
+            encoded = base64.b64encode(vector.tobytes()).decode("ascii")
+
+            rows.append({
+                "document_id": document_id,
+                "chunk_id": chunk.chunk_id,
+                "filename": chunk.filename,
+                "page_number": chunk.page_number,
+                "text": chunk.text,
+                "embedding": encoded,
+            })
+
+        # Insert in batches to avoid oversized API requests.
+        for start in range(0, len(rows), 100):
+            self.client.table("chunks").insert(
+                rows[start:start + 100]
+            ).execute()
 
     def load_index(self, document_id: str) -> DocumentIndex | None:
-        with self.connect() as connection:
-            document = connection.execute(
-                "SELECT document_id FROM documents WHERE document_id = ?",
-                (document_id,),
-            ).fetchone()
+        document = (
+            self.client.table("documents")
+            .select("document_id")
+            .eq("document_id", document_id)
+            .limit(1)
+            .execute()
+        )
 
-            if document is None:
-                return None
+        if not document.data:
+            return None
 
-            rows = connection.execute(
-                """
-                SELECT chunk_id, filename, page_number, text, embedding
-                FROM chunks
-                WHERE document_id = ?
-                ORDER BY chunk_id
-                """,
-                (document_id,),
-            ).fetchall()
+        result = (
+            self.client.table("chunks")
+            .select("chunk_id, filename, page_number, text, embedding")
+            .eq("document_id", document_id)
+            .order("chunk_id")
+            .execute()
+        )
 
         chunks = []
         embeddings = []
 
-        for row in rows:
-            chunks.append(
-                DocumentChunk(
-                    chunk_id=row["chunk_id"],
-                    filename=row["filename"],
-                    page_number=row["page_number"],
-                    text=row["text"],
-                )
-            )
+        for row in result.data:
+            chunks.append(DocumentChunk(
+                chunk_id=row["chunk_id"],
+                filename=row["filename"],
+                page_number=row["page_number"],
+                text=row["text"],
+            ))
 
-            vector = np.frombuffer(row["embedding"], dtype=np.float32).copy()
+            raw = base64.b64decode(row["embedding"])
+            vector = np.frombuffer(raw, dtype=np.float32).copy()
             embeddings.append(vector)
 
         if not embeddings:
@@ -140,25 +118,48 @@ class DocumentStorage:
         )
 
     def list_documents(self) -> list[dict]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT document_id, filename, chunk_count
-                FROM documents
-                ORDER BY filename
-                """
-            ).fetchall()
-
-        return [dict(row) for row in rows]
-
+        result = (
+            self.client.table("documents")
+            .select("document_id, filename, chunk_count")
+            .order("filename")
+            .execute()
+        )
+        return result.data
 
     def delete_document(self, document_id: str) -> bool:
-        with self.connect() as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
+        existing = (
+            self.client.table("documents")
+            .select("document_id")
+            .eq("document_id", document_id)
+            .limit(1)
+            .execute()
+        )
 
-            cursor = connection.execute(
-                "DELETE FROM documents WHERE document_id = ?",
-                (document_id,),
-            )
+        if not existing.data:
+            return False
 
-            return cursor.rowcount > 0
+        # Delete chunks explicitly before the parent document.
+        self.client.table("chunks").delete().eq(
+            "document_id", document_id
+        ).execute()
+
+        self.client.table("documents").delete().eq(
+            "document_id", document_id
+        ).execute()
+
+        return True
+
+    def upload_file(self, object_path: str, content: bytes, content_type: str):
+        return self.client.storage.from_("ida-documents").upload(
+            path=object_path,
+            file=content,
+            file_options={
+                "content-type": content_type,
+                "upsert": "true",
+            },
+        )
+
+    def delete_file(self, object_path: str):
+        return self.client.storage.from_("ida-documents").remove(
+            [object_path]
+        )

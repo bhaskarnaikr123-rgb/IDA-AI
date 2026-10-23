@@ -1,4 +1,4 @@
-
+import mimetypes
 from pathlib import Path
 from uuid import uuid4
 
@@ -70,8 +70,10 @@ def delete_document(document_id: str):
         )
 
     for extension in SUPPORTED_EXTENSIONS:
-        stored_path = UPLOAD_DIR / f"{document_id}{extension}"
-        stored_path.unlink(missing_ok=True)
+        try:
+            storage.delete_file(f"{document_id}{extension}")
+        except Exception as exc:
+            print(f"Could not delete stored file: {exc}")
 
     return {
         "message": "Document deleted successfully.",
@@ -125,24 +127,47 @@ async def upload_document(file: UploadFile = File(...)):
     document_id = str(uuid4())
     stored_path = UPLOAD_DIR / f"{document_id}{extension}"
 
+    
+    object_path = f"{document_id}{extension}"
+    uploaded_to_supabase = False
+
     try:
+        # Temporary local copy, used only for document processing.
         stored_path.write_bytes(content)
         index = pipeline.process_document(stored_path)
 
-        # Preserve the user's original filename in the retrieved metadata.
         for chunk in index.chunks:
             chunk.filename = original_filename
+
+        content_type = (
+            mimetypes.guess_type(original_filename)[0]
+            or "application/octet-stream"
+        )
+
+        storage.upload_file(object_path, content, content_type)
+        uploaded_to_supabase = True
 
         storage.save_index(document_id, index)
 
     except Exception as exc:
+        print(f"UPLOAD ERROR: {type(exc).__name__}: {exc}", flush=True)
         stored_path.unlink(missing_ok=True)
+
+        if uploaded_to_supabase:
+            try:
+                storage.delete_file(object_path)
+            except Exception as cleanup_error:
+                print("Storage cleanup failed:", cleanup_error)
+
         raise HTTPException(
             status_code=422,
-            detail=f"Could not process document: {exc}",
+            detail="Could not process or save document. Check backend logs.",
         ) from exc
+
     finally:
+        stored_path.unlink(missing_ok=True)
         await file.close()
+
 
     return {
         "document_id": document_id,
